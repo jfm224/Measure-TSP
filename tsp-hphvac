@@ -1,0 +1,146 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+
+// --- USER CONFIG ---
+const char* WIFI_SSID = "";        // put your SSID or leave empty to force AP mode
+const char* WIFI_PASS = "";        // password for STA; ignored if SSID empty
+
+#define DSM_PIN 10      // DSM501A output pin
+#define DHT_PIN 11      // DHT22 data pin
+#define DHT_TYPE DHT22
+
+const unsigned long SAMPLE_MS = 30000UL; // sampling window for dust
+const float CALIBRATION_FACTOR_PM2_5 = 0.5f; 
+const float CALIBRATION_FACTOR_TSP = 1.0f;   
+
+// --- GLOBALS ---
+volatile unsigned long lowPulseTotal_us = 0;
+volatile unsigned long pulseStart_us = 0;
+volatile bool pulseActive = false;
+
+float lastTemp = NAN;
+float lastHum = NAN;
+unsigned long lastLowPulse_us = 0;
+float lastLowPulsePercent = 0.0;
+float lastEstimatedPM25 = 0.0;
+float lastEstimatedTSP = 0.0;
+unsigned long lastSampleTimeMillis = 0;
+
+DHT dht(DHT_PIN, DHT_TYPE);
+WebServer server(80);
+
+void IRAM_ATTR sensorISR() {
+  bool level = digitalRead(DSM_PIN);
+  unsigned long t = micros();
+  if (!level) { // LOW started
+    pulseStart_us = t;
+    pulseActive = true;
+  } else { // HIGH = pulse ended
+    if (pulseActive && pulseStart_us != 0) {
+      unsigned long dur = t - pulseStart_us;
+      lowPulseTotal_us += dur;
+    }
+    pulseActive = false;
+    pulseStart_us = 0;
+  }
+}
+
+void handleRoot() {
+  String html = "<html><head><title>ESP32S3 Dust + DHT</title></head><body>";
+  html += "<h2>ESP32-S3 Dust (DSM501A) + DHT22</h2>";
+  html += "<p>Open <a href=\"/json\">/json</a> for current readings (JSON).</p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleJson() {
+  String json;
+  json += "{";
+  json += "\"temperature_c\":" + String(lastTemp, 2) + ",";
+  json += "\"humidity_pct\":" + String(lastHum, 2) + ",";
+  json += "\"lowPulse_us\":" + String(lastLowPulse_us) + ",";
+  json += "\"lowPulsePercent\":" + String(lastLowPulsePercent, 3) + ",";
+  json += "\"estimated_pm2_5_ugm3\":" + String(lastEstimatedPM25, 3) + ",";
+  json += "\"estimated_tsp_ugm3\":" + String(lastEstimatedTSP, 3) + ",";
+  json += "\"sample_time_ms\":" + String(SAMPLE_MS);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  pinMode(DSM_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(DSM_PIN), sensorISR, CHANGE);
+
+  dht.begin();
+
+  // Wi-Fi: STA or AP
+  if (strlen(WIFI_SSID) > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    unsigned long start = millis();
+    while (millis() - start < 10000 && WiFi.status() != WL_CONNECTED) {
+      delay(250);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+      Serial.println("WiFi failed. Starting AP...");
+      WiFi.softAP("ESP32S3_DUST_AP");
+      Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+    }
+  } else {
+    WiFi.softAP("ESP32S3_DUST_AP");
+    Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+  }
+
+  server.on("/", handleRoot);
+  server.on("/json", handleJson);
+  server.begin();
+  Serial.println("HTTP server started.");
+
+  lastSampleTimeMillis = millis();
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+  if (now - lastSampleTimeMillis >= SAMPLE_MS) {
+    noInterrupts();
+    unsigned long lp_us = lowPulseTotal_us;
+    if (pulseActive && pulseStart_us != 0) {
+      lp_us += (micros() - pulseStart_us);
+    }
+    lowPulseTotal_us = 0;
+    interrupts();
+
+    unsigned long sample_us = SAMPLE_MS * 1000UL;
+    float lowPulsePercent = ((float)lp_us / (float)sample_us) * 100.0f;
+
+    float estimatedPM25 = CALIBRATION_FACTOR_PM2_5 * lowPulsePercent;
+    float estimatedTSP  = CALIBRATION_FACTOR_TSP * lowPulsePercent;
+
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (!isnan(t) && !isnan(h)) {
+      lastTemp = t;
+      lastHum  = h;
+    }
+
+    lastLowPulse_us = lp_us;
+    lastLowPulsePercent = lowPulsePercent;
+    lastEstimatedPM25 = estimatedPM25;
+    lastEstimatedTSP = estimatedTSP;
+
+    Serial.printf("Sampled: LP_us=%lu LP%%=%.3f PM2.5=%.3f T=%.2f H=%.2f\n",
+                  lastLowPulse_us, lastLowPulsePercent, lastEstimatedPM25, lastTemp, lastHum);
+
+    lastSampleTimeMillis = now;
+  }
+
+  delay(20);
+}
